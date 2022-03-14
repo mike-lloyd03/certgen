@@ -1,133 +1,84 @@
 use std::fs::File;
+use std::ops::Add;
 use std::os::unix::prelude::FileExt;
 
-use openssl::asn1::Asn1Time;
-use openssl::hash::{hash, MessageDigest};
-use openssl::pkey::{PKey, Private};
-use openssl::rsa::Rsa;
-use openssl::stack::Stack;
-use openssl::x509;
-use openssl::x509::extension;
+use rcgen::Certificate;
+use rcgen::CertificateParams;
+use rcgen::{self, CertificateSigningRequest, KeyPair};
+
+use time::{Duration, OffsetDateTime};
 
 fn main() {
-    // let ca = gen_ca();
-    // make_pem_ca(ca);
-    let csr = gen_csr();
-    make_pem_req(csr);
+    let ca = gen_ca();
+    make_pem_cert(&ca, "ca.pem");
+    let csr = gen_csr(vec!["github.com".to_string(), "www.github.com".to_string()]);
+    sign_csr(csr, ca);
 }
 
-fn gen_ca() -> x509::X509 {
-    let mut ca_builder = x509::X509Builder::new().unwrap();
-    let key_usage = extension::KeyUsage::new()
-        .crl_sign()
-        .key_cert_sign()
-        .build()
-        .unwrap();
-    let basic_constraints = extension::BasicConstraints::new().ca().build().unwrap();
-    ca_builder.append_extension(key_usage).unwrap();
-    ca_builder.append_extension(basic_constraints).unwrap();
+fn gen_ca() -> Certificate {
+    let mut params = CertificateParams::new(vec![]);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::KeyCertSign,
+    ];
+    params.distinguished_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.not_before = OffsetDateTime::now_local().unwrap();
+    params.not_after = params.not_before.add(Duration::days(3650));
 
-    let subj_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
-    ca_builder.set_subject_name(&subj_name).unwrap();
-
-    let valid_days = days(3650);
-    ca_builder.set_not_before(&valid_days.0).unwrap();
-    ca_builder.set_not_after(&valid_days.1).unwrap();
-
-    let key = gen_key();
-    ca_builder.set_pubkey(&key).unwrap();
-
-    ca_builder.sign(&key, MessageDigest::sha512()).unwrap();
-    ca_builder.build()
+    Certificate::from_params(params).unwrap()
 }
 
-fn gen_csr() -> x509::X509Req {
-    let mut req_builder = x509::X509ReqBuilder::new().unwrap();
-    let ctx = req_builder.x509v3_context(None);
-    let key_usage = extension::KeyUsage::new()
-        .non_repudiation()
-        .digital_signature()
-        .key_encipherment()
-        .build()
-        .unwrap();
-    let sub_alt_names = extension::SubjectAlternativeName::new()
-        .dns("github.com")
-        .dns("www.github.com")
-        .build(&ctx)
-        .unwrap();
+fn gen_csr(sub_alt_names: Vec<String>) -> CertificateSigningRequest {
+    let mut params = CertificateParams::new(sub_alt_names);
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::ContentCommitment, // non-repudiation
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.distinguished_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
+    params.not_before = OffsetDateTime::now_local().unwrap();
+    params.not_after = params.not_before.add(Duration::days(3650));
 
-    let mut extensions = Stack::new().unwrap();
-    extensions.push(key_usage).unwrap();
-    extensions.push(sub_alt_names).unwrap();
-    req_builder.add_extensions(&extensions).unwrap();
-
-    let subj_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
-    req_builder.set_subject_name(&subj_name).unwrap();
-
-    let key = gen_key();
-    req_builder.set_pubkey(&key).unwrap();
-
-    req_builder.sign(&key, MessageDigest::sha512()).unwrap();
-    req_builder.build()
+    let cert = Certificate::from_params(params).unwrap();
+    let csr_pem = cert.serialize_request_pem().unwrap();
+    CertificateSigningRequest::from_pem(&csr_pem).unwrap()
 }
 
-fn sign_csr(csr: x509::X509Req, ca_key: PKey<Private>) {
-    let mut req_builder = x509::X509ReqBuilder::new().unwrap();
-    let ctx = req_builder.x509v3_context(None);
-    let sub_key_identifier = extension::SubjectKeyIdentifier::new().build(&ctx).unwrap();
-    let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
-        .keyid(true)
-        .issuer(true)
-        .build(&ctx)
-        .unwrap();
-    let key_usage = extension::KeyUsage::new()
-        .non_repudiation()
-        .digital_signature()
-        .key_encipherment()
-        .build()
-        .unwrap();
-    let ext_key_usage = extension::ExtendedKeyUsage::new()
-        .server_auth()
-        .build()
-        .unwrap();
-
-    let mut extensions = Stack::new().unwrap();
-    extensions.push(sub_key_identifier).unwrap();
-    extensions.push(auth_key_identifier).unwrap();
-    extensions.push(key_usage).unwrap();
-    extensions.push(ext_key_usage).unwrap();
+fn sign_csr(csr: CertificateSigningRequest, ca_cert: Certificate) {
+    let cert_pem = csr.serialize_pem_with_signer(&ca_cert).unwrap();
+    let file = File::create("cert.pem").unwrap();
+    file.write_all_at(cert_pem.as_bytes(), 0).unwrap();
 }
 
-fn gen_key() -> PKey<Private> {
-    let rsa = Rsa::generate(4096).unwrap();
-    PKey::from_rsa(rsa).unwrap()
+fn gen_key() -> KeyPair {
+    // from https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-gpnap/a48b02b2-2a10-4eb0-bed4-1807a6d2f5ad
+    let sha512rsa_oid: [u64; 7] = [1, 2, 840, 113549, 1, 1, 13];
+    let sha512rsa = rcgen::SignatureAlgorithm::from_oid(&sha512rsa_oid).unwrap();
+    KeyPair::generate(sha512rsa).unwrap()
 }
 
-fn make_pem_req(req: x509::X509Req) {
-    let pem = req.to_pem().unwrap();
-    let file = File::create("./req.pem").unwrap();
-    file.write_all_at(&pem, 0).unwrap();
+fn subject_name(c: &str, st: &str, l: &str, o: &str, cn: &str) -> rcgen::DistinguishedName {
+    use rcgen::DnType::*;
+
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(CountryName, c);
+    dn.push(StateOrProvinceName, st);
+    dn.push(LocalityName, l);
+    dn.push(OrganizationName, o);
+    dn.push(CommonName, cn);
+    dn
 }
 
-fn make_pem_ca(req: x509::X509) {
-    let pem = req.to_pem().unwrap();
-    let file = File::create("./cert.pem").unwrap();
-    file.write_all_at(&pem, 0).unwrap();
+fn make_pem_cert(cert: &Certificate, path: &str) {
+    let pem = cert.serialize_pem().unwrap();
+    let file = File::create(path).unwrap();
+    file.write_all_at(pem.as_bytes(), 0).unwrap();
 }
 
-fn subject_name(c: &str, st: &str, l: &str, o: &str, cn: &str) -> x509::X509Name {
-    let mut subj_name_builder = x509::X509NameBuilder::new().unwrap();
-    subj_name_builder.append_entry_by_text("C", c).unwrap();
-    subj_name_builder.append_entry_by_text("ST", st).unwrap();
-    subj_name_builder.append_entry_by_text("L", l).unwrap();
-    subj_name_builder.append_entry_by_text("O", o).unwrap();
-    subj_name_builder.append_entry_by_text("CN", cn).unwrap();
-    subj_name_builder.build()
-}
-
-fn days(days: u32) -> (Asn1Time, Asn1Time) {
-    (
-        Asn1Time::days_from_now(0).unwrap(),
-        Asn1Time::days_from_now(days).unwrap(),
-    )
-}
+// fn make_pem_cert(csr: CertificateSigningRequest, path: &str) {
+//     let pem = csr.serialize_pem_with_signer
+//     let file = File::create(path).unwrap();
+//     file.write_all_at(pem.as_bytes(), 0).unwrap();
+// }
