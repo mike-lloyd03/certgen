@@ -72,7 +72,7 @@ fn gen_csr() -> x509::X509Req {
 }
 
 fn sign_csr(csr: x509::X509Req, ca_key: PKey<Private>) {
-    let mut req_builder = x509::X509ReqBuilder::new().unwrap();
+    let req_builder = x509::X509ReqBuilder::new().unwrap();
     let ctx = req_builder.x509v3_context(None);
     let sub_key_identifier = extension::SubjectKeyIdentifier::new().build(&ctx).unwrap();
     let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
