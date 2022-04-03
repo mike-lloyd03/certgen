@@ -92,7 +92,10 @@ fn sign_csr(csr: &x509::X509Req, ca: &x509::X509, ca_key: &PKey<Private>) -> x50
     let server_auth = extended_key_usage.server_auth().build().unwrap();
     builder.append_extension2(&server_auth).unwrap();
 
-    let ctx = builder.x509v3_context(Some(ca), None);
+    // let pem = std::fs::read("./cert/ca.crt").unwrap();
+    // let ca = x509::X509::from_pem(&pem).unwrap();
+
+    let ctx = builder.x509v3_context(Some(ca.as_ref()), None);
     let sub_key_identifier = extension::SubjectKeyIdentifier::new().build(&ctx).unwrap();
     let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
         .keyid(true)
