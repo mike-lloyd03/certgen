@@ -2,138 +2,143 @@ use std::fs::File;
 use std::os::unix::prelude::FileExt;
 
 use openssl::asn1::Asn1Time;
+use openssl::bn::{BigNum, MsbOption};
+use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Private};
+use openssl::pkey::{PKey, PKeyRef, Private};
 use openssl::rsa::Rsa;
-use openssl::stack::Stack;
 use openssl::x509;
 use openssl::x509::extension;
+use openssl::x509::X509;
 
 fn main() {
-    let key = gen_key();
-    let ca = gen_ca(&key);
-    // make_pem_ca(ca);
-    let csr = gen_csr();
-    // make_pem_req(&csr);
-    let cert = sign_csr(&csr, &ca, &key);
-    make_pem_cert(&cert);
-}
-
-fn gen_ca(key: &PKey<Private>) -> x509::X509 {
-    let mut ca_builder = x509::X509Builder::new().unwrap();
-    let key_usage = extension::KeyUsage::new()
-        .crl_sign()
-        .key_cert_sign()
-        .build()
-        .unwrap();
-    let basic_constraints = extension::BasicConstraints::new().ca().build().unwrap();
-    ca_builder.append_extension(key_usage).unwrap();
-    ca_builder.append_extension(basic_constraints).unwrap();
-
-    let subj_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
-    ca_builder.set_subject_name(&subj_name).unwrap();
-
-    let valid_days = days(3650);
-    ca_builder.set_not_before(&valid_days.0).unwrap();
-    ca_builder.set_not_after(&valid_days.1).unwrap();
-
-    ca_builder.set_pubkey(key).unwrap();
-
-    ca_builder.sign(&key, MessageDigest::sha512()).unwrap();
-    ca_builder.build()
-}
-
-fn gen_csr() -> x509::X509Req {
-    let mut req_builder = x509::X509ReqBuilder::new().unwrap();
-    let ctx = req_builder.x509v3_context(None);
-    let key_usage = extension::KeyUsage::new()
-        .non_repudiation()
-        .digital_signature()
-        .key_encipherment()
-        .build()
-        .unwrap();
-    let sub_alt_names = extension::SubjectAlternativeName::new()
-        .dns("github.com")
-        .dns("www.github.com")
-        .build(&ctx)
-        .unwrap();
-
-    let mut extensions = Stack::new().unwrap();
-    extensions.push(key_usage).unwrap();
-    extensions.push(sub_alt_names).unwrap();
-    req_builder.add_extensions(&extensions).unwrap();
-
-    let subj_name = subject_name("US", "CA", "SD", "ProxyCert", "ProxyCert");
-    req_builder.set_subject_name(&subj_name).unwrap();
-
-    let key = gen_key();
-    req_builder.set_pubkey(&key).unwrap();
-
-    req_builder.sign(&key, MessageDigest::sha512()).unwrap();
-    req_builder.build()
-}
-
-fn sign_csr(csr: &x509::X509Req, ca: &x509::X509, ca_key: &PKey<Private>) -> x509::X509 {
-    let mut builder = x509::X509Builder::new().unwrap();
-    builder.set_subject_name(csr.subject_name()).unwrap();
-    builder.set_pubkey(&csr.public_key().unwrap()).unwrap();
-
-    match csr.extensions() {
-        Ok(extensions) => extensions
-            .iter()
-            .map(|ext| builder.append_extension2(ext))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|_| ()),
-        _ => Ok(()),
-    }
+    let (ca, ca_key) = gen_ca().unwrap();
+    let (cert, _cert_key) = gen_cert(
+        &ca,
+        &ca_key,
+        vec!["github.com".to_string(), "*.github.com".to_string()],
+    )
     .unwrap();
+    make_pem(&ca, "./ca.pem");
+    make_pem(&cert, "./cert.pem");
+}
 
-    let mut extended_key_usage = extension::ExtendedKeyUsage::new();
-    let server_auth = extended_key_usage.server_auth().build().unwrap();
-    builder.append_extension2(&server_auth).unwrap();
+pub fn gen_ca() -> Result<(X509, PKey<Private>), ErrorStack> {
+    let rsa = Rsa::generate(2048)?;
+    let key_pair = PKey::from_rsa(rsa)?;
 
-    // let pem = std::fs::read("./cert/ca.crt").unwrap();
-    // let ca = x509::X509::from_pem(&pem).unwrap();
+    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test");
 
-    let ctx = builder.x509v3_context(Some(ca.as_ref()), None);
-    let sub_key_identifier = extension::SubjectKeyIdentifier::new().build(&ctx).unwrap();
-    let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
-        .keyid(true)
-        .issuer(true)
-        .build(&ctx)
-        .unwrap();
-
-    builder.append_extension2(&sub_key_identifier).unwrap();
-    builder.append_extension2(&auth_key_identifier).unwrap();
+    let mut cert_builder = X509::builder()?;
+    cert_builder.set_version(2)?;
+    let serial_number = {
+        let mut serial = BigNum::new()?;
+        serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
+        serial.to_asn1_integer()?
+    };
+    cert_builder.set_serial_number(&serial_number)?;
+    cert_builder.set_subject_name(&x509_name)?;
+    cert_builder.set_issuer_name(&x509_name)?;
+    cert_builder.set_pubkey(&key_pair)?;
 
     let days = days(365);
-    builder.set_not_before(&days.0).unwrap();
-    builder.set_not_after(&days.1).unwrap();
+    cert_builder.set_not_before(&days.0)?;
+    cert_builder.set_not_after(&days.1)?;
 
-    builder.sign(ca_key, MessageDigest::sha512()).unwrap();
-    builder.build()
+    cert_builder.append_extension(extension::BasicConstraints::new().critical().ca().build()?)?;
+    cert_builder.append_extension(
+        extension::KeyUsage::new()
+            .critical()
+            .key_cert_sign()
+            .crl_sign()
+            .build()?,
+    )?;
+
+    let subject_key_identifier =
+        extension::SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
+    cert_builder.append_extension(subject_key_identifier)?;
+
+    cert_builder.sign(&key_pair, MessageDigest::sha256())?;
+    let cert = cert_builder.build();
+
+    Ok((cert, key_pair))
 }
 
-fn gen_key() -> PKey<Private> {
-    let rsa = Rsa::generate(4096).unwrap();
-    PKey::from_rsa(rsa).unwrap()
+fn gen_csr(key_pair: &PKey<Private>) -> Result<x509::X509Req, ErrorStack> {
+    let mut req_builder = x509::X509ReqBuilder::new()?;
+    req_builder.set_pubkey(key_pair)?;
+
+    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test");
+    req_builder.set_subject_name(&x509_name)?;
+
+    req_builder.sign(key_pair, MessageDigest::sha256())?;
+    let req = req_builder.build();
+    Ok(req)
 }
 
-fn make_pem_req(req: &x509::X509Req) {
-    let pem = req.to_pem().unwrap();
-    let file = File::create("./req.pem").unwrap();
-    file.write_all_at(&pem, 0).unwrap();
+pub fn gen_cert(
+    ca_cert: &x509::X509Ref,
+    ca_key_pair: &PKeyRef<Private>,
+    dns_names: Vec<String>,
+) -> Result<(X509, PKey<Private>), ErrorStack> {
+    let rsa = Rsa::generate(2048)?;
+    let key_pair = PKey::from_rsa(rsa)?;
+
+    let req = gen_csr(&key_pair)?;
+
+    let mut cert_builder = X509::builder()?;
+    cert_builder.set_version(2)?;
+    let serial_number = {
+        let mut serial = BigNum::new()?;
+        serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
+        serial.to_asn1_integer()?
+    };
+    cert_builder.set_serial_number(&serial_number)?;
+    cert_builder.set_subject_name(req.subject_name())?;
+    cert_builder.set_issuer_name(ca_cert.subject_name())?;
+    cert_builder.set_pubkey(&key_pair)?;
+    let not_before = Asn1Time::days_from_now(0)?;
+    cert_builder.set_not_before(&not_before)?;
+    let not_after = Asn1Time::days_from_now(365)?;
+    cert_builder.set_not_after(&not_after)?;
+
+    cert_builder.append_extension(extension::BasicConstraints::new().build()?)?;
+
+    cert_builder.append_extension(
+        extension::KeyUsage::new()
+            .critical()
+            .non_repudiation()
+            .digital_signature()
+            .key_encipherment()
+            .build()?,
+    )?;
+
+    let subject_key_identifier = extension::SubjectKeyIdentifier::new()
+        .build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
+    cert_builder.append_extension(subject_key_identifier)?;
+
+    let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
+        .keyid(false)
+        .issuer(false)
+        .build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
+    cert_builder.append_extension(auth_key_identifier)?;
+
+    let mut subject_alt_name = extension::SubjectAlternativeName::new();
+    for name in dns_names {
+        subject_alt_name.dns(&name);
+    }
+    let san = subject_alt_name.build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
+    cert_builder.append_extension(san)?;
+
+    cert_builder.sign(ca_key_pair, MessageDigest::sha256())?;
+    let cert = cert_builder.build();
+
+    Ok((cert, key_pair))
 }
 
-fn make_pem_ca(req: x509::X509) {
-    let pem = req.to_pem().unwrap();
-    let file = File::create("./cert.pem").unwrap();
-    file.write_all_at(&pem, 0).unwrap();
-}
-
-fn make_pem_cert(cert: &x509::X509) {
+fn make_pem(cert: &X509, path: &str) {
     let pem = cert.to_pem().unwrap();
-    let file = File::create("./cert.pem").unwrap();
+    let file = File::create(path).unwrap();
     file.write_all_at(&pem, 0).unwrap();
 }
 
