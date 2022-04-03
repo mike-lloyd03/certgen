@@ -2,7 +2,7 @@ use std::fs::File;
 use std::os::unix::prelude::FileExt;
 
 use openssl::asn1::Asn1Time;
-use openssl::hash::{hash, MessageDigest};
+use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
 use openssl::stack::Stack;
@@ -10,13 +10,16 @@ use openssl::x509;
 use openssl::x509::extension;
 
 fn main() {
-    // let ca = gen_ca();
+    let key = gen_key();
+    let ca = gen_ca(&key);
     // make_pem_ca(ca);
     let csr = gen_csr();
-    make_pem_req(csr);
+    // make_pem_req(&csr);
+    let cert = sign_csr(&csr, &ca, &key);
+    make_pem_cert(&cert);
 }
 
-fn gen_ca() -> x509::X509 {
+fn gen_ca(key: &PKey<Private>) -> x509::X509 {
     let mut ca_builder = x509::X509Builder::new().unwrap();
     let key_usage = extension::KeyUsage::new()
         .crl_sign()
@@ -34,8 +37,7 @@ fn gen_ca() -> x509::X509 {
     ca_builder.set_not_before(&valid_days.0).unwrap();
     ca_builder.set_not_after(&valid_days.1).unwrap();
 
-    let key = gen_key();
-    ca_builder.set_pubkey(&key).unwrap();
+    ca_builder.set_pubkey(key).unwrap();
 
     ca_builder.sign(&key, MessageDigest::sha512()).unwrap();
     ca_builder.build()
@@ -71,31 +73,42 @@ fn gen_csr() -> x509::X509Req {
     req_builder.build()
 }
 
-fn sign_csr(csr: x509::X509Req, ca_key: PKey<Private>) {
-    let req_builder = x509::X509ReqBuilder::new().unwrap();
-    let ctx = req_builder.x509v3_context(None);
+fn sign_csr(csr: &x509::X509Req, ca: &x509::X509, ca_key: &PKey<Private>) -> x509::X509 {
+    let mut builder = x509::X509Builder::new().unwrap();
+    builder.set_subject_name(csr.subject_name()).unwrap();
+    builder.set_pubkey(&csr.public_key().unwrap()).unwrap();
+
+    match csr.extensions() {
+        Ok(extensions) => extensions
+            .iter()
+            .map(|ext| builder.append_extension2(ext))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|_| ()),
+        _ => Ok(()),
+    }
+    .unwrap();
+
+    let mut extended_key_usage = extension::ExtendedKeyUsage::new();
+    let server_auth = extended_key_usage.server_auth().build().unwrap();
+    builder.append_extension2(&server_auth).unwrap();
+
+    let ctx = builder.x509v3_context(Some(ca), None);
     let sub_key_identifier = extension::SubjectKeyIdentifier::new().build(&ctx).unwrap();
     let auth_key_identifier = extension::AuthorityKeyIdentifier::new()
         .keyid(true)
         .issuer(true)
         .build(&ctx)
         .unwrap();
-    let key_usage = extension::KeyUsage::new()
-        .non_repudiation()
-        .digital_signature()
-        .key_encipherment()
-        .build()
-        .unwrap();
-    let ext_key_usage = extension::ExtendedKeyUsage::new()
-        .server_auth()
-        .build()
-        .unwrap();
 
-    let mut extensions = Stack::new().unwrap();
-    extensions.push(sub_key_identifier).unwrap();
-    extensions.push(auth_key_identifier).unwrap();
-    extensions.push(key_usage).unwrap();
-    extensions.push(ext_key_usage).unwrap();
+    builder.append_extension2(&sub_key_identifier).unwrap();
+    builder.append_extension2(&auth_key_identifier).unwrap();
+
+    let days = days(365);
+    builder.set_not_before(&days.0).unwrap();
+    builder.set_not_after(&days.1).unwrap();
+
+    builder.sign(ca_key, MessageDigest::sha512()).unwrap();
+    builder.build()
 }
 
 fn gen_key() -> PKey<Private> {
@@ -103,7 +116,7 @@ fn gen_key() -> PKey<Private> {
     PKey::from_rsa(rsa).unwrap()
 }
 
-fn make_pem_req(req: x509::X509Req) {
+fn make_pem_req(req: &x509::X509Req) {
     let pem = req.to_pem().unwrap();
     let file = File::create("./req.pem").unwrap();
     file.write_all_at(&pem, 0).unwrap();
@@ -111,6 +124,12 @@ fn make_pem_req(req: x509::X509Req) {
 
 fn make_pem_ca(req: x509::X509) {
     let pem = req.to_pem().unwrap();
+    let file = File::create("./cert.pem").unwrap();
+    file.write_all_at(&pem, 0).unwrap();
+}
+
+fn make_pem_cert(cert: &x509::X509) {
+    let pem = cert.to_pem().unwrap();
     let file = File::create("./cert.pem").unwrap();
     file.write_all_at(&pem, 0).unwrap();
 }
