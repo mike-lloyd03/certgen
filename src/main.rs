@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::os::unix::prelude::FileExt;
 
+use anyhow::Result;
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
-use openssl::error::ErrorStack;
 use openssl::hash::MessageDigest;
+use openssl::pkcs12;
 use openssl::pkey::{PKey, PKeyRef, Private};
 use openssl::rsa::Rsa;
 use openssl::x509;
@@ -13,21 +14,22 @@ use openssl::x509::X509;
 
 fn main() {
     let (ca, ca_key) = gen_ca().unwrap();
-    let (cert, _cert_key) = gen_cert(
+    let (cert, cert_key) = gen_cert(
         &ca,
         &ca_key,
         vec!["github.com".to_string(), "*.github.com".to_string()],
     )
     .unwrap();
-    make_pem(&ca, "./ca.pem");
-    make_pem(&cert, "./cert.pem");
+    make_pem(&ca, "./ca.pem").unwrap();
+    make_pem(&cert, "./cert.pem").unwrap();
+    to_pkcs12(cert.as_ref(), &cert_key, "./cert.p12").unwrap();
 }
 
-pub fn gen_ca() -> Result<(X509, PKey<Private>), ErrorStack> {
+pub fn gen_ca() -> Result<(X509, PKey<Private>)> {
     let rsa = Rsa::generate(2048)?;
     let key_pair = PKey::from_rsa(rsa)?;
 
-    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test");
+    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test")?;
 
     let mut cert_builder = X509::builder()?;
     cert_builder.set_version(2)?;
@@ -41,7 +43,7 @@ pub fn gen_ca() -> Result<(X509, PKey<Private>), ErrorStack> {
     cert_builder.set_issuer_name(&x509_name)?;
     cert_builder.set_pubkey(&key_pair)?;
 
-    let days = days(365);
+    let days = days(365)?;
     cert_builder.set_not_before(&days.0)?;
     cert_builder.set_not_after(&days.1)?;
 
@@ -64,11 +66,11 @@ pub fn gen_ca() -> Result<(X509, PKey<Private>), ErrorStack> {
     Ok((cert, key_pair))
 }
 
-fn gen_csr(key_pair: &PKey<Private>) -> Result<x509::X509Req, ErrorStack> {
+fn gen_csr(key_pair: &PKey<Private>) -> Result<x509::X509Req> {
     let mut req_builder = x509::X509ReqBuilder::new()?;
     req_builder.set_pubkey(key_pair)?;
 
-    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test");
+    let x509_name = subject_name("US", "CA", "RIV", "Rudy", "test")?;
     req_builder.set_subject_name(&x509_name)?;
 
     req_builder.sign(key_pair, MessageDigest::sha256())?;
@@ -80,7 +82,7 @@ pub fn gen_cert(
     ca_cert: &x509::X509Ref,
     ca_key_pair: &PKeyRef<Private>,
     dns_names: Vec<String>,
-) -> Result<(X509, PKey<Private>), ErrorStack> {
+) -> Result<(X509, PKey<Private>)> {
     let rsa = Rsa::generate(2048)?;
     let key_pair = PKey::from_rsa(rsa)?;
 
@@ -136,25 +138,33 @@ pub fn gen_cert(
     Ok((cert, key_pair))
 }
 
-fn make_pem(cert: &X509, path: &str) {
-    let pem = cert.to_pem().unwrap();
-    let file = File::create(path).unwrap();
-    file.write_all_at(&pem, 0).unwrap();
+fn make_pem(cert: &X509, path: &str) -> Result<()> {
+    let pem = cert.to_pem()?;
+    let file = File::create(path)?;
+    file.write_all_at(&pem, 0)?;
+    Ok(())
 }
 
-fn subject_name(c: &str, st: &str, l: &str, o: &str, cn: &str) -> x509::X509Name {
-    let mut subj_name_builder = x509::X509NameBuilder::new().unwrap();
-    subj_name_builder.append_entry_by_text("C", c).unwrap();
-    subj_name_builder.append_entry_by_text("ST", st).unwrap();
-    subj_name_builder.append_entry_by_text("L", l).unwrap();
-    subj_name_builder.append_entry_by_text("O", o).unwrap();
-    subj_name_builder.append_entry_by_text("CN", cn).unwrap();
-    subj_name_builder.build()
+pub fn to_pkcs12(cert: &x509::X509Ref, key: &PKeyRef<Private>, path: &str) -> Result<()> {
+    let builder = pkcs12::Pkcs12::builder();
+    let pkcs12 = builder.build("", "", key, cert)?;
+    let der = pkcs12.to_der()?;
+
+    let file = File::create(path)?;
+    file.write_all_at(&der, 0)?;
+    Ok(())
 }
 
-fn days(days: u32) -> (Asn1Time, Asn1Time) {
-    (
-        Asn1Time::days_from_now(0).unwrap(),
-        Asn1Time::days_from_now(days).unwrap(),
-    )
+fn subject_name(c: &str, st: &str, l: &str, o: &str, cn: &str) -> Result<x509::X509Name> {
+    let mut subj_name_builder = x509::X509NameBuilder::new()?;
+    subj_name_builder.append_entry_by_text("C", c)?;
+    subj_name_builder.append_entry_by_text("ST", st)?;
+    subj_name_builder.append_entry_by_text("L", l)?;
+    subj_name_builder.append_entry_by_text("O", o)?;
+    subj_name_builder.append_entry_by_text("CN", cn)?;
+    Ok(subj_name_builder.build())
+}
+
+fn days(days: u32) -> Result<(Asn1Time, Asn1Time)> {
+    Ok((Asn1Time::days_from_now(0)?, Asn1Time::days_from_now(days)?))
 }
