@@ -20,8 +20,8 @@ fn main() {
         vec!["github.com".to_string(), "*.github.com".to_string()],
     )
     .unwrap();
-    make_pem(&ca, "./ca.pem").unwrap();
-    make_pem(&cert, "./cert.pem").unwrap();
+    to_pem(&ca, "./ca.pem").unwrap();
+    to_pem(&cert, "./cert.pem").unwrap();
     to_pkcs12(cert.as_ref(), &cert_key, "./cert.p12").unwrap();
 }
 
@@ -138,7 +138,7 @@ pub fn gen_cert(
     Ok((cert, key_pair))
 }
 
-fn make_pem(cert: &X509, path: &str) -> Result<()> {
+fn to_pem(cert: &X509, path: &str) -> Result<()> {
     let pem = cert.to_pem()?;
     let file = File::create(path)?;
     file.write_all_at(&pem, 0)?;
